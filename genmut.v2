@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+import collections
+import argparse
+import json
+import os
+from readfasta import read_record
+
+def get_cdss(exons):
+	rnaseq = ''
+	orf    = ''
+	cdss   = []
+	for exon in exons:
+		rnaseq += mutseq[exon[0]:exon[1]+1]
+	#print(f'>rnaseq\n{rnaseq}')
+	
+	for i in range(0, len(rnaseq)-2):
+		start = (rnaseq[i:i+3] == 'ATG')
+		if start:
+			cur_orf = ''
+			for j in range(i, len(rnaseq)-2, 3):
+				cur_orf += rnaseq[j:j+3]
+				if rnaseq[j:j+3] in stop_codons:
+					if len(cur_orf) > len(orf):
+						orf = cur_orf
+						orf_pos = [i,j+3]
+					break
+	tot = 0
+	exon_start = None
+	orf_start = orf_pos[0]
+	for idx, exon in enumerate(exons):
+		exlen = exon[1]-exon[0]
+		tot += exlen
+		if tot > orf_pos[0]:
+			exon_start = idx
+			break
+		orf_start -= exlen + 1
+	
+	r = len(orf)
+	for idx, exon in enumerate(exons[exon_start:]):
+		if idx == 0:
+			if exon[0] + orf_start + r > exon[1]:
+				cdss.append([exon[0]+orf_start,exon[1]])
+				r = r - (exon[1] - (exon[0] + orf_start)) -1
+			else:
+				cdss.append([exon[0]+orf_start,exon[0]+orf_start+r-1])
+				break
+		else:
+			if exon[0] + r > exon[1]:
+				cdss.append(exon)
+				r = r - (exon[1] - exon[0]) -1
+			else:
+				cdss.append([exon[0],exon[0]+r-1])
+				break
+	return cdss
+
+parser = argparse.ArgumentParser(description='Simulate splice-site-generating point mutaitons')
+parser.add_argument('fasta', type=str, metavar='<fasta>', help='input path to fasta file')
+parser.add_argument('gff', type=str, metavar='<gff>', help='input path to gff file')
+parser.add_argument('-m', type=float, metavar='<float>', required=False, default='1.0',
+	help='input Manhattan distance threshold for selecting mutant isoforms (default: 1.0)')
+parser.add_argument('-p', type=float, metavar='<float>', required=False, default='0.01',
+	help='input probability threshold for selecting mutant isoforms (default: 0.01)')
+parser.add_argument('-o', type=str, metavar='<out_dir>', required=False, help='output dir')
+arg = parser.parse_args()
+
+os.makedirs(arg.o, exist_ok=True)
+if arg.o: OUTDIR = os.path.abspath(arg.o)
+else: OUTDIR = os.path.abspath('.')
+
+base_name = None
+# Generate all possible splice site mutants
+for idn, seq in read_record(arg.fasta):
+	file_name = os.path.basename(arg.fasta)
+	base_name = os.path.splitext(file_name)[0]
+	count = 1
+	for i in range(0, len(seq)-1, 2):
+		# donor site
+			cur_id  = None
+			cur_seq = None
+			if seq[i] == 'G' and seq[i+1] != 'T':
+				cur_id  = f'{idn} {i+1} d {seq[i+1]}~T'
+				cur_seq = f'{seq[:i+1]}T{seq[i+2:]}'
+			if seq[i] != 'G' and seq[i+1] == 'T':
+				cur_id  = f'{idn} {i} d {seq[i]}~G'
+				cur_seq = f'{seq[:i]}G{seq[i+1:]}'
+		# acceptor site
+			if seq[i] == 'A' and seq[i+1] != 'G':
+				cur_id  = f'{idn} {i+1} a {seq[i+1]}~G'
+				cur_seq = f'{seq[:i+1]}G{seq[i+2:]}'
+			if seq[i] != 'A' and seq[i+1] == 'G':
+				cur_id  = f'{idn} {i} a {seq[i]}~A'
+				cur_seq = f'{seq[:i]}A{seq[i+1:]}'
+		# out
+			if cur_id is not None:
+				os.makedirs(f'{OUTDIR}/mutants/{base_name}', exist_ok=True)
+				with open(f'{OUTDIR}/mutants/{base_name}/mut_{count}_{base_name}.fa', 'w') as fh:
+					fh.write(f'>{cur_id}\n')
+					for i in range(0, len(cur_seq), 80):
+						fh.write(cur_seq[i:i+80])
+				count+=1
+
+# Run isoformer on all splice site mutants and og sequence
+MODELS_DIR = os.path.abspath('../genomikon/isoformer/data')
+MODELS = f'--dpwm {MODELS_DIR}/donor.pwm --apwm {MODELS_DIR}/acceptor.pwm\
+	--emm {MODELS_DIR}/exon.mm --imm {MODELS_DIR}/intron.mm\
+	--elen {MODELS_DIR}/exon.len --ilen {MODELS_DIR}/intron.len'
+
+for mutant in os.listdir(f'{OUTDIR}/mutants/{base_name}'):
+	os.makedirs(f'{OUTDIR}/mutantiso/{base_name}', exist_ok=True)
+	mut_base = os.path.splitext(mutant)[0]
+	os.system(f'isoformer_hm {MODELS} {OUTDIR}/mutants/{base_name}/{mutant} \
+		--introns data/mini_genes/{base_name}.gff3 > \
+		{OUTDIR}/mutantiso/{base_name}/{mut_base}.isoform')
+os.makedirs(f'{OUTDIR}/ogiso', exist_ok=True)
+os.system(f'isoformer {MODELS} {arg.fasta} --introns {arg.gff} > \
+	{OUTDIR}/ogiso/{base_name}.isoform')
+
+# Generate cmpiso output and summaries
+os.makedirs(f'{OUTDIR}/cmpiso', exist_ok=True)
+for mutantiso in os.listdir(f'{OUTDIR}/mutantiso/{base_name}'):
+	os.system(f'cmpiso_hm {OUTDIR}/ogiso/{base_name}.isoform \
+		{OUTDIR}/mutantiso/{base_name}/{mutantiso} >> {OUTDIR}/cmpiso/{base_name}.cmp')
+
+true_mutants = {}
+true_mutants_sum = {}
+with open(f'{OUTDIR}/cmpiso/{base_name}.cmp') as fh:
+	for line in fh.readlines():
+		dist = float(line.split()[0])
+		mut  = line.split()[1]
+		gene = mut.split('_')[2]
+		true_mut = False
+		if dist > arg.m:
+			with open(f'{OUTDIR}/mutantiso/{base_name}/{mut}.isoform') as mf:
+				idn = mf.readline().split()
+				pos = int(idn[5])
+				typ = idn[6]
+				for line in mf.readlines():
+					if line.startswith('#'): continue
+					if len(line.split()) < 8: continue
+					if line.split()[2] != 'intron': continue
+					if typ == 'd' and int(line.split()[3]) == pos+1: true_mut = True
+					if typ == 'a' and int(line.split()[4]) == pos+1: true_mut = True
+			if true_mut:
+				if gene not in true_mutants: true_mutants[gene] = {}
+				if gene not in true_mutants_sum: true_mutants_sum[gene] = 0
+				true_mutants_sum[gene] += 1
+				true_mutants[gene][mut] = str(dist)	
+
+os.makedirs(f'{OUTDIR}/jsonout', exist_ok=True)
+with open(f'{OUTDIR}/jsonout/{base_name}.json', 'w') as fh:
+	fh.write(json.dumps(true_mutants, indent=4))
+with open(f'{OUTDIR}/jsonout/{base_name}_summary.json', 'w') as fh:
+	true_mutants_sum = dict(sorted(true_mutants_sum.items(), key=lambda item: item[1], reverse=True))
+	fh.write(json.dumps(true_mutants_sum, indent=4))
+
+# Select isoform and output orf fasta
+stop_codons = ['TAA', 'TAG', 'TGA']
+for mutant in true_mutants:
+	for mutiso in true_mutants[mutant]:
+		mutseq = ''
+		for idn, seq in read_record(f'{OUTDIR}/mutants/{base_name}/{mutiso}.fa'): mutseq += seq
+		mut_pos = None
+		mut_typ = None
+		isoforms = []
+		with open(f'{OUTDIR}/mutantiso/{base_name}/{mutiso}.isoform') as fh:
+			isoform = []
+			while True:
+				line = fh.readline()
+				if line == '': break
+				line = line.rstrip()
+				if line.startswith('#'):
+					if line.startswith('# name'):
+						mut_pos = int(line.split()[5])
+						mut_typ = line.split()[6]
+					continue
+				fields = line.split()
+				if len(fields) > 8 and fields[2] == 'mRNA' and float(fields[5]) > arg.p:
+					isoform.append(line)
+				if len(fields) < 1 and len(isoform) > 1:
+					isoforms.append(isoform)
+					isoform = []
+				if len(isoform) > 0 and fields[2] != 'mRNA': isoform.append(line)
+		
+		ff_id = None
+		with open(f'{OUTDIR}/mutants/{base_name}/{mutiso}.fa') as fh:
+			ff_id = fh.readline().rstrip()
+		
+		os.makedirs(f'{OUTDIR}/selected_iso', exist_ok=True)
+		for idx, isoform in enumerate(isoforms):
+			exons = []
+			introns = []
+			prob = None
+			for line in isoform:
+				fields = line.split()
+				if fields[2] == 'mRNA': prob = float(fields[5])
+				if fields[2] == 'exon':
+					exons.append([int(fields[3])-1, int(fields[4])-1])
+				if fields[2] == 'intron':
+					introns.append(int(fields[3])-1)
+					introns.append(int(fields[4])-1)
+			if mut_pos in introns:
+				os.makedirs(f'{OUTDIR}/selected_iso/{base_name}', exist_ok=True)
+				mut_cdss = get_cdss(exons)
+				with open(f'{OUTDIR}/selected_iso/{base_name}/{mutiso}_{idx}.fa', 'w') as fh:
+					fh.write(f'{ff_id} ')
+					for cds in mut_cdss: fh.write(str(cds))
+					fh.write(f' {prob}\n')
+					for cds in mut_cdss: fh.write(f'{mutseq[cds[0]:cds[1]+1]}')
+
+# Translate selected isoforms
+os.makedirs(f'{OUTDIR}/selected_pep', exist_ok=True)
+for orf in os.listdir(f'{OUTDIR}/selected_iso/{base_name}'):
+	os.makedirs(f'{OUTDIR}/selected_pep/{base_name}', exist_ok=True)
+	os.system(f'~/algorithms/python/longestorf {OUTDIR}/selected_iso/{base_name}/{orf} \
+		> {OUTDIR}/selected_pep/{base_name}/{orf}')
+
